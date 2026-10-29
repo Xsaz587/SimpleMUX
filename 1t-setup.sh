@@ -2,7 +2,8 @@
 # 1t-setup — всё в одном файле:
 #   установка по категориям, графические среды, запуск рабочего стола,
 #   проверка мощности, чёрные рамки меню, ISO/EXE/APK,
-#   ПОЧИНКА (пакеты, звук, два динамика, отчёт-промпт).
+#   ПОЧИНКА (пакеты, звук, два динамика, отчёт-промпт),
+#   зелёный прогресс-бар с бегущим бликом, выбор файла (Android / обзор / путь).
 # Запуск:  bash 1t-setup.sh
 
 G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; B=$'\e[1m'; N=$'\e[0m'
@@ -22,6 +23,84 @@ run_logged(){
   return "${PIPESTATUS[0]}"
 }
 
+# =====================================================================
+#  Прогресс-бар: зелёный, по заполненной части бежит светлый блик (как в Windows 10)
+# =====================================================================
+trap 'printf "\e[?25h"' EXIT
+BASE_R=6;   BASE_G=176; BASE_B=37     # основной зелёный
+LITE_R=120; LITE_G=235; LITE_B=135    # чуть светлее — бегущий блик
+BAR_W=30; LAST_OUT=""
+
+bar_line(){   # $1 = процент (-1 — неизвестно, тогда бегает блок)  $2 = кадр  → BAR_OUT
+  local pct=$1 fr=$2 w=$BAR_W i d k r g b filled=0 c span
+  BAR_OUT=""
+  if (( pct >= 0 )); then
+    filled=$(( w * pct / 100 )); span=$(( filled + 10 )); c=$(( (fr/2) % span - 4 ))
+  else
+    span=$(( w + 10 )); c=$(( (fr/2) % span - 5 ))
+  fi
+  for (( i=0; i<w; i++ )); do
+    d=$(( i>c ? i-c : c-i )); k=$(( d<5 ? 5-d : 0 ))
+    if (( pct >= 0 )); then
+      if (( i >= filled )); then r=45; g=45; b=45
+      else r=$(( BASE_R+(LITE_R-BASE_R)*k/5 )); g=$(( BASE_G+(LITE_G-BASE_G)*k/5 )); b=$(( BASE_B+(LITE_B-BASE_B)*k/5 )); fi
+    else
+      if (( d <= 4 )); then r=$(( BASE_R+(LITE_R-BASE_R)*k/5 )); g=$(( BASE_G+(LITE_G-BASE_G)*k/5 )); b=$(( BASE_B+(LITE_B-BASE_B)*k/5 ))
+      else r=45; g=45; b=45; fi
+    fi
+    BAR_OUT+=$'\e[38;2;'"$r;$g;${b}m█"
+  done
+}
+
+run_bar(){    # run_bar "Название" команда…   (вывод — в лог, для apt процент настоящий)
+  local title="$1" out st pid fr=0 pct=-1 phase="" kind a b c line txt cols p rc
+  shift
+  out=$(mktemp "$STATE/out.XXXXXX"); st=$(mktemp "$STATE/st.XXXXXX")
+  cols=$(tput cols 2>/dev/null || echo 50)
+  BAR_W=$(( cols - 10 )); (( BAR_W > 40 )) && BAR_W=40; (( BAR_W < 10 )) && BAR_W=10
+  echo "=== $(date '+%F %T') $*" >>"$LOG"
+  ( DEBIAN_FRONTEND=noninteractive "$@" </dev/null >"$out" 2>&1 3>"$st" ) &
+  pid=$!
+  printf '\e[?25l\n\n'
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( fr % 5 == 0 )); then
+      line=$(tail -n 1 "$st" 2>/dev/null)
+      if [[ $line == dlstatus:* || $line == pmstatus:* ]]; then
+        IFS=: read -r kind a b c <<<"$line"
+        b=${b%%.*}; [[ $b =~ ^[0-9]+$ ]] && pct=$b
+        [[ $kind == dlstatus ]] && phase="Загрузка" || phase="Установка"
+      fi
+    fi
+    txt="${phase:-Работаю}: $title"; (( ${#txt} > cols-3 )) && txt="${txt:0:cols-6}..."
+    bar_line "$pct" "$fr"
+    if (( pct >= 0 )); then p=$(printf '%3d%%' "$pct"); else p=" … "; fi
+    printf '\e[2A\r\e[K %s%s%s\n\r\e[K %s\e[0m %s\n' "$B" "$txt" "$N" "$BAR_OUT" "$p"
+    fr=$((fr+1)); sleep 0.04
+  done
+  wait "$pid"; rc=$?
+  printf '\e[2A\r\e[J\e[?25h'
+  cat "$out" >>"$LOG"; rm -f "$st"; LAST_OUT="$out"
+  return $rc
+}
+
+job(){        # job "Название" команда… — прогресс-бар + итог: что скачалось / какая ошибка
+  local title="$1" rc l err; shift
+  run_bar "$title" "$@"; rc=$?
+  if (( rc == 0 )); then
+    sed -nE 's/^Get:[0-9]+ [^ ]+ [^ ]+ [^ ]+ ([^ ]+) .*\[([^]]+)\]$/\1 (\2)/p' "$LAST_OUT" \
+      | while IFS= read -r l; do echo "${G}  ↓ скачан: $l${N}"; done
+    echo "${G}✓ $title — успешно${N}"
+  else
+    echo "${R}✗ $title — ошибка (код $rc)${N}"
+    err=$(grep -iE '^(E:|Err:)|error|unable|failed|cannot|not found|no space|denied|unmet' "$LAST_OUT" | tail -n 6)
+    [ -z "$err" ] && err=$(tail -n 4 "$LAST_OUT")
+    while IFS= read -r l; do echo "${R}  $l${N}"; done <<<"$err"
+    echo "  Полный лог: $LOG"
+  fi
+  rm -f "$LAST_OUT"; return $rc
+}
+apt_get(){ apt-get -o APT::Status-Fd=3 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"; }
+
 CATS=("Видео и графика" "Звук" "Оболочки (shell)" "Графические среды" \
       "Пакеты для XFCE" "Композитор и темы" "Языки программирования" \
       "Пакеты и сервисы" "Виртуализация и эмуляция" "Приложения" "Ввод и сеть")
@@ -34,18 +113,19 @@ add(){ ITEMS+=("$1|$2|$3|$4|$5"); }
 # ---------- особые пункты ----------
 chk_mobox(){ [ -d "$HOME/mobox" ]; }
 ins_mobox(){
-  pkg install -y curl || return 1
-  curl -fL -o "$HOME/mobox_install" https://raw.githubusercontent.com/olegos2/mobox/main/install \
-    && bash "$HOME/mobox_install"
+  job "Установка curl" apt_get install -y curl || return 1
+  job "Скачивание установщика Mobox" curl -fL -o "$HOME/mobox_install" \
+    https://raw.githubusercontent.com/olegos2/mobox/main/install || return 1
+  bash "$HOME/mobox_install"
 }
 chk_ohmyzsh(){ [ -d "$HOME/.oh-my-zsh" ]; }
 ins_ohmyzsh(){
-  pkg install -y git zsh || return 1
-  git clone --depth 1 https://github.com/ohmyzsh/ohmyzsh "$HOME/.oh-my-zsh" || return 1
+  job "Установка git и zsh" apt_get install -y git zsh || return 1
+  job "Скачивание Oh My Zsh" git clone --depth 1 https://github.com/ohmyzsh/ohmyzsh "$HOME/.oh-my-zsh" || return 1
   [ -f "$HOME/.zshrc" ] || cp "$HOME/.oh-my-zsh/templates/zshrc.zsh-template" "$HOME/.zshrc"
 }
 chk_zshdef(){ [ "$(readlink "$HOME/.termux/shell" 2>/dev/null)" = "$PREFIX/bin/zsh" ]; }
-ins_zshdef(){ pkg install -y zsh && chsh -s zsh; }
+ins_zshdef(){ job "Установка zsh" apt_get install -y zsh && chsh -s zsh; }
 
 # ---------- Видео и графика ----------
 add "Видео и графика" "Mesa (OpenGL)"                    "mesa"
@@ -149,8 +229,8 @@ installed(){
 
 ensure_repo(){
   case "$1" in
-    x11) pkg_ok x11-repo || { run_logged pkg install -y x11-repo && run_logged pkg update -y; } ;;
-    tur) pkg_ok tur-repo || { run_logged pkg install -y tur-repo && run_logged pkg update -y; } ;;
+    x11) pkg_ok x11-repo || { job "Репозиторий x11" apt_get install -y x11-repo && job "Обновление списков пакетов" apt_get update; } ;;
+    tur) pkg_ok tur-repo || { job "Репозиторий tur" apt_get install -y tur-repo && job "Обновление списков пакетов" apt_get update; } ;;
   esac
 }
 
@@ -177,7 +257,7 @@ install_item(){
   local p="$1" r="$2" tok alts alt hit i fail=0
   ensure_repo "$r"
   if [[ $p == @* ]]; then
-    "ins_${p#@}" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"
+    "ins_${p#@}"; return $?
   fi
   for tok in $p; do
     installed_tok "$tok" && continue
@@ -195,8 +275,8 @@ install_item(){
       echo "$tok" >>"$FAILED"; fail=1; continue
     fi
     echo "${G}✓ найден в репозитории: $hit${N}"
-    if ! run_logged pkg install -y "$hit"; then
-      echo "${R}не удалось установить $hit${N}"; echo "$hit" >>"$FAILED"; fail=1
+    if ! job "Установка $hit" apt_get install -y "$hit"; then
+      echo "$hit" >>"$FAILED"; fail=1
     fi
   done
   return $fail
@@ -393,14 +473,14 @@ start_desktop(){
   pkill -f termux.x11 2>/dev/null; pkill virgl_test_server 2>/dev/null; pkill picom 2>/dev/null
   export XDG_RUNTIME_DIR="${TMPDIR:-$PREFIX/tmp}"
   termux-x11 :0 >/dev/null 2>&1 &
-  sleep 3
+  job "Запуск Termux:X11" sleep 3
   am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity >/dev/null 2>&1
   export DISPLAY=:0 PULSE_SERVER=127.0.0.1
   pulseaudio --check 2>/dev/null || pulseaudio --start --exit-idle-time=-1 --daemonize \
     --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1"
   case "$GPU" in
     virgl) virgl_test_server_android >/dev/null 2>&1 &
-           sleep 1; export GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.0 ;;
+           job "Запуск VirGL" sleep 1; export GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.0 ;;
     zink)  export MESA_LOADER_DRIVER_OVERRIDE=zink TU_DEBUG=noconform ;;
     *)     export GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1 ;;
   esac
@@ -414,15 +494,100 @@ start_desktop(){
 # =====================================================================
 #  ISO / EXE / APK
 # =====================================================================
+hsize(){ awk -v b="$1" 'BEGIN{split("B K M G T",u," "); i=1; while(b>=1024&&i<5){b/=1024;i++} f=(i==1?"%d %s":"%.1f %s"); printf f, b, u[i]}'; }
+
+# Обзор папок в консоли: цифры — войти/выбрать, u — вверх, можно вписать путь (как cd)
+browse_files(){   # $1 = расширения через |   → PICKED
+  local ext="$1" dir items name i n page=0 per=10 first last sel all=0 args e _e p sz pages
+  if   [ -d "$HOME/storage/downloads" ]; then dir="$HOME/storage/downloads"
+  elif [ -d /sdcard/Download ]; then dir=/sdcard/Download
+  elif [ -d /sdcard ]; then dir=/sdcard; else dir="$HOME"; fi
+  while true; do
+    items=(); args=()
+    if (( all )); then args=(-name '*')
+    else IFS='|' read -ra _e <<<"$ext"; for e in "${_e[@]}"; do args+=(-o -iname "*.$e"); done; args=("${args[@]:1}"); fi
+    while IFS= read -r -d '' name; do items+=("$name/"); done < <(find -L "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\0' 2>/dev/null | sort -z)
+    while IFS= read -r -d '' name; do items+=("$name");  done < <(find -L "$dir" -mindepth 1 -maxdepth 1 -type f ! -name '.*' \( "${args[@]}" \) -printf '%f\0' 2>/dev/null | sort -z)
+    n=${#items[@]}; pages=$(( (n+per-1)/per )); (( pages<1 )) && pages=1
+    (( page >= pages )) && page=$((pages-1))
+    clear; echo "${B}${C}Обзор: $dir${N}"
+    (( all )) && echo "(показаны все файлы)" || echo "(показаны: ${ext//|/, })"; echo
+    first=$(( page*per )); last=$(( first+per )); (( last>n )) && last=$n
+    if (( n == 0 )); then
+      echo "  (пусто)"; [ -r "$dir" ] || echo "  ${R}нет доступа — выполни termux-setup-storage${N}"
+    fi
+    for (( i=first; i<last; i++ )); do
+      name="${items[$i]}"
+      if [[ $name == */ ]]; then printf ' %2d) %s%s%s\n' $((i+1)) "$C" "$name" "$N"
+      else sz=$(hsize "$(stat -c %s "$dir/$name" 2>/dev/null || echo 0)")
+           printf ' %2d) %s%s%s  %s\n' $((i+1)) "$G" "$name" "$N" "$sz"; fi
+    done
+    echo; echo " стр. $((page+1))/$pages   n — дальше, b — назад"
+    echo " u — вверх  h — домой  s — /sdcard  a — все файлы  0 — отмена"
+    echo " Номер — открыть/выбрать, либо впиши путь (/… или ~/…)"
+    read -rp "> " sel
+    case "$sel" in
+      0|"") return 1 ;;
+      u) dir=$(dirname "$dir"); page=0 ;;
+      h) dir="$HOME"; page=0 ;;
+      s) [ -d /sdcard ] && dir=/sdcard; page=0 ;;
+      a) all=$((1-all)); page=0 ;;
+      n) (( (page+1)*per < n )) && page=$((page+1)) ;;
+      b) (( page > 0 )) && page=$((page-1)) ;;
+      /*|~*) p="${sel/#\~/$HOME}"
+             if [ -d "$p" ]; then dir="${p%/}"; [ -z "$dir" ] && dir=/; page=0
+             elif [ -f "$p" ]; then PICKED="$p"; return 0
+             else echo "Нет такого пути."; sleep 1; fi ;;
+      *) if [[ $sel =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=n )); then
+           name="${items[$((sel-1))]}"
+           if [[ $name == */ ]]; then dir="${dir%/}/${name%/}"; page=0
+           else PICKED="${dir%/}/$name"; return 0; fi
+         fi ;;
+    esac
+  done
+}
+
+# Системное окно выбора файла Android (нужен termux-api + приложение Termux:API)
+android_pick(){   # $1 = ISO|EXE|APK
+  local out
+  command -v termux-storage-get >/dev/null || { echo "${R}Нужен пакет termux-api и приложение Termux:API.${N}"; pause; return 1; }
+  mkdir -p "$STATE/picked"; out="$STATE/picked/last.${1,,}"; rm -f "$out"
+  echo "${Y}Открываю выбор файла Android… Файл будет СКОПИРОВАН в $STATE/picked"
+  echo "(для больших ISO это долго и занимает место — лучше пункт 2).${N}"
+  termux-storage-get "$out"
+  [ -s "$out" ] || { echo "Ничего не выбрано."; pause; return 1; }
+  PICKED="$out"
+}
+
+pick_file(){   # $1 = ISO|EXE|APK  $2 = расширения через |   → PICKED, код 0 если выбран
+  local ans; PICKED=""
+  while true; do
+    clear; echo "${B}${C}Выбор файла: $1${N}"; echo
+    echo " 1) Менюшка Android (системный выбор файла)"
+    echo " 2) Обзор папок в консоли (как cd + список)"
+    echo " 3) Вписать путь вручную"
+    echo " 0) отмена"
+    read -rp "> " ans
+    case "$ans" in
+      1) android_pick "$1" && return 0 ;;
+      2) browse_files "$2" && return 0 ;;
+      3) read -erp "Путь к файлу: " PICKED
+         PICKED="${PICKED//\"/}"; PICKED="${PICKED/#\~/$HOME}"
+         [ -f "$PICKED" ] && return 0; echo "Файл не найден."; pause ;;
+      0|"") return 1 ;;
+    esac
+  done
+}
+
 run_iso(){
   local iso disk size ram cores disp
   command -v qemu-system-x86_64 >/dev/null || { echo "${R}Нет QEMU — поставь в «Виртуализация».${N}"; pause; return; }
-  read -rp "Путь к ISO: " iso
-  [ -f "$iso" ] || { echo "Файл не найден."; pause; return; }
+  pick_file ISO 'iso|img' || return
+  iso="$PICKED"; echo "Выбран: ${B}$iso${N}"
   mkdir -p "$HOME/vm"; disk="$HOME/vm/disk.qcow2"
   if [ ! -f "$disk" ]; then
     read -rp "Размер диска ГБ [16]: " size; size=${size:-16}
-    qemu-img create -f qcow2 "$disk" "${size}G"
+    job "Создание диска ${size} ГБ" qemu-img create -f qcow2 "$disk" "${size}G" || { pause; return; }
   fi
   ram=$(awk '/MemAvailable/{r=int($2/1024/2); if(r<1024)r=1024; if(r>4096)r=4096; print r}' /proc/meminfo)
   cores=$(( $(nproc) / 2 )); (( cores < 1 )) && cores=1
@@ -436,8 +601,9 @@ run_iso(){
   pause
 }
 run_exe(){
-  local f; read -rp "Путь к .exe: " f
-  [ -f "$f" ] || { echo "Файл не найден."; pause; return; }
+  local f
+  pick_file EXE 'exe|msi|bat' || return
+  f="$PICKED"; echo "Выбран: ${B}$f${N}"
   export DISPLAY="${DISPLAY:-:0}"
   if command -v wine >/dev/null; then echo "Запускаю через Wine (нужен запущенный Termux:X11)…"; wine "$f"
   elif [ -d "$HOME/mobox" ]; then echo "Mobox установлен: запусти его по README проекта и открой этот файл там."
@@ -448,16 +614,17 @@ install_apk(){
   local f
   echo "${Y}Termux сам APK не запускает — это Linux-окружение, не Android.${N}"
   echo "Но можно открыть установщик Android (Termux должен иметь право ставить приложения)."
-  read -rp "Путь к .apk: " f
-  [ -f "$f" ] || { echo "Файл не найден."; pause; return; }
-  command -v termux-open >/dev/null || pkg install -y termux-tools
+  pause
+  pick_file APK 'apk' || return
+  f="$PICKED"
+  command -v termux-open >/dev/null || job "Установка termux-tools" apt_get install -y termux-tools
   termux-open "$f"; pause
 }
 vm_menu(){
   local ans
   while true; do
     clear; echo "${B}${C}ISO / EXE / APK${N}"; echo
-    echo " 1) Запустить ISO в QEMU (x86, может не заработать/тормозить)"
+    echo " 1) Запустить ISO в QEMU (x86, выбор файла; может тормозить)"
     echo " 2) Запустить .exe (Wine / Mobox)"
     echo " 3) Установить .apk в Android"
     echo " 0) назад"
@@ -507,7 +674,7 @@ retry_failed(){
   local n ok=0
   for n in $(sort -u "$FAILED"); do
     echo "${Y}  повторная установка: $n${N}"
-    run_logged pkg install -y "${n%%/*}" || ok=1
+    job "Повторная установка $n" apt_get install -y "${n%%/*}" || ok=1
   done
   [ $ok = 0 ] && : >"$FAILED"
   return $ok
@@ -519,27 +686,27 @@ fx_locks(){
         "$PREFIX/var/cache/apt/archives/lock" "$PREFIX/var/lib/apt/lists/lock"
   return 0
 }
-fx_dpkg(){ run_logged dpkg --configure -a; }
+fx_dpkg(){ job "Достройка установок (dpkg --configure -a)" dpkg --configure -a; }
 fx_fixbroken(){
-  run_logged apt --fix-broken install -y \
-  || run_logged apt -o Dpkg::Options::="--force-overwrite" --fix-broken install -y
+  job "Починка зависимостей" apt_get --fix-broken install -y \
+  || job "Починка зависимостей (force-overwrite)" apt_get -o Dpkg::Options::=--force-overwrite --fix-broken install -y
 }
 fx_update(){
   net_ok || echo "${R}Нет ответа от зеркала из sources — проверь интернет/VPN.${N}"
-  run_logged pkg update -y && return 0
+  job "Обновление списков пакетов" apt_get update && return 0
   if ask_yn "Обновление не прошло. Сменить зеркало (termux-change-repo)?"; then
-    termux-change-repo && run_logged pkg update -y
+    termux-change-repo && job "Обновление списков пакетов" apt_get update
   else return 1; fi
 }
-fx_keys(){ run_logged pkg install -y termux-keyring && run_logged pkg update -y; }
-fx_clean(){ apt clean; rm -rf "$PREFIX"/var/lib/apt/lists/*; run_logged pkg update -y; }
+fx_keys(){ job "Ключи репозиториев" apt_get install -y termux-keyring && job "Обновление списков пакетов" apt_get update; }
+fx_clean(){ apt clean; rm -rf "$PREFIX"/var/lib/apt/lists/*; job "Обновление списков пакетов" apt_get update; }
 fx_upgrade(){
-  run_logged apt-get -y -o Dpkg::Options::="--force-overwrite" -o Dpkg::Options::="--force-confnew" dist-upgrade
+  job "Полное обновление" apt-get -y -o APT::Status-Fd=3 -o Dpkg::Options::=--force-overwrite -o Dpkg::Options::=--force-confnew dist-upgrade
 }
 fx_reinstall(){
   local n ok=0
   [ -s "$FAILED" ] || return 1
-  for n in $(sort -u "$FAILED"); do run_logged apt-get install --reinstall -y "${n%%/*}" || ok=1; done
+  for n in $(sort -u "$FAILED"); do job "Переустановка $n" apt_get install --reinstall -y "${n%%/*}" || ok=1; done
   return $ok
 }
 
@@ -592,7 +759,7 @@ pa_start(){
   sleep 1; pa_running
 }
 gen_tones(){
-  pkg_ok sox || run_logged pkg install -y sox >/dev/null
+  pkg_ok sox || job "Установка sox" apt_get install -y sox
   [ -f "$TONE" ] || sox -n -c 2 -r 44100 "$TONE" synth 1.2 sine 440 2>/dev/null
   [ -f "$TL" ] || sox -n -c 2 -r 44100 "$TL" synth 1.2 sine 440 remix 1 0 2>/dev/null
   [ -f "$TR" ] || sox -n -c 2 -r 44100 "$TR" synth 1.2 sine 660 remix 0 1 2>/dev/null
@@ -633,7 +800,7 @@ a_reinstall(){ run_logged apt-get install --reinstall -y pulseaudio && pa_start;
 repair_audio(){
   clear; echo "${B}${C}Починка звука${N}"; echo
   ATT=(); gen_tones
-  pkg_ok pulseaudio || run_logged pkg install -y pulseaudio
+  pkg_ok pulseaudio || job "Установка pulseaudio" apt_get install -y pulseaudio
   echo "Сначала проверим как есть."
   if heard; then echo "${G}Звук работает.${N}"; pause; return; fi
   att "Исходный тест: звука нет"
@@ -704,7 +871,7 @@ reset_audio_cfg(){
 audio_stereo(){
   clear; echo "${B}${C}Два динамика вместе${N}"; echo
   gen_tones
-  pkg_ok pulseaudio || run_logged pkg install -y pulseaudio
+  pkg_ok pulseaudio || job "Установка pulseaudio" apt_get install -y pulseaudio
   ATT=()
   echo "Слушай: левый (низкий тон), правый (высокий), потом оба."
   if test_lr; then echo "${G}Оба динамика уже работают.${N}"; pause; return; fi
@@ -823,7 +990,7 @@ repair_menu(){
 # =====================================================================
 main(){
   local i j c l p r f cat tot ok choice
-  compgen -G "$PREFIX/var/lib/apt/lists/*Packages*" >/dev/null || { echo "Обновляю списки пакетов…"; pkg update -y; }
+  compgen -G "$PREFIX/var/lib/apt/lists/*Packages*" >/dev/null || job "Обновление списков пакетов" apt_get update
   while true; do
     clear
     echo "${B}${C}=== 1t-setup ===${N}  [среда: $DE | графика: $GPU | композитор: $COMP]"; echo
@@ -850,7 +1017,7 @@ main(){
       s) sysinfo ;;
       w) wifi_scan ;;
       v) vm_menu ;;
-      u) run_logged pkg update -y && run_logged pkg upgrade -y; pause ;;
+      u) job "Обновление списков пакетов" apt_get update && job "Обновление пакетов" apt_get -y full-upgrade; pause ;;
       *) if [[ $choice =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#CATS[@]} )); then
            menu_cat "${CATS[$((choice-1))]}"
          fi ;;
